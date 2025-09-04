@@ -11,7 +11,7 @@ import pandas as pd
 from dotenv import load_dotenv
 import boto3
 from botocore.client import Config
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, BotoCoreError
 
 # ================ Secrets loader ================
 load_dotenv()
@@ -87,26 +87,59 @@ def _safe_rerun():
     except AttributeError:
         st.experimental_rerun()
 
+from botocore.exceptions import ClientError, BotoCoreError
+
 def list_objects(prefix: str, limit: int = 200000) -> List[Dict[str, Any]]:
-    """Return list of dicts: Key, Size, LastModified (datetime)"""
+    """Return list of dicts: Key, Size, LastModified (datetime). Manual pagination for robustness."""
     out: List[Dict[str, Any]] = []
-    paginator = s3.get_paginator("list_objects_v2")
-    try:
-        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
-            for obj in page.get("Contents", []):
-                key = obj["Key"]
-                if key.endswith("/"):
-                    continue
-                out.append({
-                    "Key": key,
-                    "Size": int(obj.get("Size", 0)),
-                    "LastModified": obj.get("LastModified"),
-                })
-                if len(out) >= limit:
-                    return out
-    except ClientError as e:
-        st.error(f"Error listing {prefix}: {e}")
+    token: Optional[str] = None
+    seen = 0
+
+    # Normalize prefix once
+    effective_prefix = prefix
+
+    while True:
+        try:
+            kwargs: Dict[str, Any] = {
+                "Bucket": S3_BUCKET,
+                "Prefix": effective_prefix,
+                "MaxKeys": 1000,
+            }
+            if token:
+                kwargs["ContinuationToken"] = token
+
+            resp = s3.list_objects_v2(**kwargs)
+
+        except ClientError as e:
+            # Show the real S3 error (Streamlit may still redact, but we try)
+            err = getattr(e, "response", {}).get("Error", {}) or {}
+            code = err.get("Code", "ClientError")
+            msg  = err.get("Message", str(e))
+            st.error(f"Error listing '{effective_prefix}': {code} — {msg}")
+            return out
+        except (BotoCoreError, Exception) as e:
+            st.error(f"Unexpected error listing '{effective_prefix}': {e}")
+            return out
+
+        for obj in resp.get("Contents", []) or []:
+            key = obj.get("Key", "")
+            if not key or key.endswith("/"):
+                continue
+            out.append({
+                "Key": key,
+                "Size": int(obj.get("Size", 0) or 0),
+                "LastModified": obj.get("LastModified"),
+            })
+            seen += 1
+            if seen >= limit:
+                return out
+
+        if not resp.get("IsTruncated"):
+            break
+        token = resp.get("NextContinuationToken")
+
     return out
+
 
 # ===== Selection helpers (no callbacks) =====
 def _ensure_select_state(sec: str, n_rows: int, default: bool = False):
